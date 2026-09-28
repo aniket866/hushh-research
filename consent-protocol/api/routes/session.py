@@ -38,12 +38,14 @@ async def issue_session_token(
     request: SessionTokenRequest, authorization: Optional[str] = Header(None)
 ):
     """
-    Issue a session token after passphrase verification.
+    Issue a limited-scope session token after Firebase authentication.
 
     SECURITY: Requires Firebase ID token in Authorization header.
     The userId in request body MUST match the verified token's UID.
 
-    Called after successful passphrase unlock on the frontend.
+    NOTE: "session" scope is REJECTED here. Master vault access (VAULT_OWNER)
+    requires passphrase or hardware key verification; use
+    POST /api/consent/vault-owner-token for that flow.
     """
     from hushh_mcp.consent.token import issue_token
     from hushh_mcp.constants import ConsentScope
@@ -81,12 +83,23 @@ async def issue_session_token(
         raise HTTPException(status_code=500, detail="Internal server error")
 
     try:
-        # Issue token with session scope
-        # Issue token with session scope
-        # If request asks for "session", grant VAULT_OWNER (Master Scope)
-        scope_to_grant = (
-            ConsentScope.VAULT_OWNER if request.scope == "session" else ConsentScope(request.scope)
-        )
+        # Prevent silent privilege escalation: "session" scope must NOT silently
+        # grant VAULT_OWNER (master vault access). Callers that need VAULT_OWNER
+        # must complete passphrase / hardware-key verification via
+        # POST /api/consent/vault-owner-token instead.
+        if request.scope == "session":
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "AUTH_VAULT_OWNER_REQUIRES_UNLOCK",
+                    "message": (
+                        "Master vault access requires passphrase or hardware key verification. "
+                        "Use POST /api/consent/vault-owner-token."
+                    ),
+                },
+            )
+
+        scope_to_grant = ConsentScope(request.scope)
 
         token_obj = issue_token(
             user_id=request.userId,
