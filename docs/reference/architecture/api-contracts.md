@@ -198,21 +198,140 @@ vault key, connector credential, scope payload, or decrypted value is stored.
 
 #### Continuing the asking chat after an answer
 
-When the other person approves, declines, or lets a chat-sent request expire,
-the requester's app opens one follow-up turn in the same conversation with
+When the other person approves, declines, lets a chat-sent request expire, or
+later ends access, the requester's app opens one follow-up turn in the same
+conversation with
 `forwardedProps.consentContinuation = {bundleId, outcome, sharedInformation?}`
-and the fixed message `Consent approved`, `Request declined` or `Request
-expired`. `POST /api/one/agent-chat` admits it only with the requester's
-VAULT_OWNER token and chat key, only in the conversation that recorded the
-submission, only when the ledger's current outcome for that bundle (read as the
-requester) equals `outcome`, and only once per bundle (`409` otherwise). No tool
-runs in that turn. `sharedInformation` is accepted only for
-an approval (≤ 12,000 characters), is the text the requester's device decrypted
-from the approved export, and is held as a 10-minute in-memory request secret;
-session state carries only its reference. Anything else returns `400`/`409`.
+and the fixed message for that outcome:
+
+| `outcome` | Fixed message |
+| --- | --- |
+| `granted` | `Consent approved` |
+| `partially_granted` | `Partly approved` |
+| `denied` | `Request declined` |
+| `expired` | `Request expired` |
+| `revoked` | `Access ended` |
+
+`POST /api/one/agent-chat` admits it only with the requester's VAULT_OWNER token
+and chat key, only in the conversation that recorded the submission, only when
+the ledger's current outcome for that bundle (`progress.outcome`, read as the
+requester) equals `outcome`, and only once per bundle (`409` otherwise). The one
+exception: a bundle continued with `granted` or `partially_granted` may be
+continued once more with `expired` or `revoked`. A client that sends `granted`
+for a partial answer is admitted and recorded as `partially_granted`. The model
+is told which fields were shared and which were not. No tool runs in that turn
+(tool calling mode `NONE`) and it runs at the lowest thinking level the model
+accepts. `sharedInformation` is accepted only for `granted`/`partially_granted`
+(≤ 12,000 characters), is the text the requester's device decrypted from the
+approved export, and is held as a 10-minute in-memory request secret; session
+state carries only its reference. Anything else returns `400`/`409`.
+**Sensitive values never reach the model (CONTRACT-2 C7).** The device sends a
+sensitive item's field-name outline instead of its values. Admission enforces
+it again before the text is stored: each line of an item whose
+`sensitivity` is `sensitive` (or missing) becomes
+`- <label>: N fields (<names>). Sensitive: shown to the person in the secure card on their device; the values are not shared with you.`,
+built from key names only, and a line no `standard` item claims is dropped.
+It logs `one.consent_sensitive_stripped count=<lines>` (a count only). The
+turn's instruction names those items and tells One the values are in the secure
+card above, never to guess or restate them.
 `GET /api/one/agent-chat/history/{conversation_id}` returns `consentOutcomes`
-(`{bundleId: outcome}` for bundles already continued) and restores the follow-up
-message as a `selection` chip.
+(`{bundleId: outcome}` for bundles already continued), `consentAccessEnded`
+(`{bundleId: "revoked"|"expired"}`), and restores the follow-up message as a
+`selection` chip.
+
+**Redaction after access ends (CONTRACT C3).** Every turn that ran while a
+bundle's shared information was live in the conversation (the answer turn and
+later turns until access ends) is recorded against the bundle in sealed session
+state. Before each later model call the server re-reads the bundle as the
+requester; once access has ended (`revoked`, `expired`, or `progress.ended_at`
+set) it replaces those turns' model-side content in the model request with
+`Access to <labels> from <name> ended; do not use or repeat it.` Turns are
+located by identity: the person's own messages in the request are aligned in
+order with the sealed session's user events, and everything else between two
+of them belongs to that turn. If a tagged turn cannot be located, that bundle
+fails closed and every model-side content from its first tagged turn onward is
+replaced. A fenced shared block, or a tool payload naming an ended bundle, is
+replaced wherever it appears. Each model call logs
+`one.consent_redaction bundles=… tagged_turns=… replaced=… mode=identity|fail_closed`
+(bundle ids and counts only). Stored sealed events are not modified.
+
+The continuation record (`temp:hussh:consent_continuation`) belongs to its
+answer turn only. The encrypted session store never seals `temp:` state and
+drops any it finds in an older row; a shared continuation record seen in any
+later invocation is refused (`one.consent_continuation_stale`), and a fenced
+shared block is stripped from any other turn's instruction. Measured
+2026-09-28: before this, the sealed record re-rendered the shared block into
+every later turn for its 10-minute lifetime, blocked their tools, and skipped
+the revoke check. In the history response, those turns' assistant
+messages carry `metadata.consentBundleId` and
+`metadata.consentAccess = {bundleId, state: "live"|"ended", outcome, personName, labels}`;
+once ended the message's `content` is `""`, its cards and activity are dropped,
+`metadata.consentAccessEnded` is `true`, and only one such message is returned
+per turn. The status chip carries `consentBundleId` (and `consentAccessEnded`).
+
+#### Request progress (CONTRACT C1)
+
+`GET /api/one/information-requests/{bundle_id}` (VAULT_OWNER, requester-bound)
+keeps `bundleId, personRef, purpose, durationSeconds, cancelled, items` and adds:
+
+```json
+"progress": {
+  "requested_at": "iso",
+  "delivered_at": "iso|null",
+  "seen_at": "iso|null",
+  "decided_at": "iso|null",
+  "outcome": "pending|granted|partially_granted|denied|expired|revoked|cancelled",
+  "access_ends_at": "iso|null",
+  "ended_at": "iso|null",
+  "fields": [{"scope": "attr.food.preferences.*", "label": "Food preferences", "sensitivity": "sensitive|standard", "status": "pending|granted|denied|expired|revoked|cancelled"}]
+}
+```
+
+`delivered_at` is the first `NOTIFICATION_SENT` and `seen_at` the first
+`NOTIFICATION_OPENED` for any field. `decided_at` is set once no field is
+pending. `access_ends_at` is when current access ends. `ended_at` is when access
+that was granted ended (revoked or ran out); it stays `null` for a request that
+expired before a decision. `revoked` (the owner ended it) is never reported as
+`expired` (time ended it). `cancelled` means the requester withdrew. Labels come
+from `hushh_mcp/consent/scope_labels.py`. A field in a credential domain is
+refused at creation with `403` even if a catalog offered it.
+
+`sensitivity` (on `items[]`, `progress.fields[]`, catalog items, viewer-profile
+grants and the shared-with-me card) comes from one server function,
+`hushh_mcp/consent/scope_sensitivity.py` `scope_sensitivity(scope, pkm_tags)`.
+It is `sensitive` for the tax, financial or banking, identity or government-id,
+health or medical, and credentials domains (by registry key or by the words of
+a dynamic domain or path), for any scope a PKM tag (`restricted`,
+`confidential`, `sensitive`) marks, including a wildcard over a tagged branch,
+and for anything that is not a well-formed `attr.<domain>` scope. Everything
+else is `standard`. A stored `standard` never downgrades it.
+
+#### Outcome doorbell: `information_request_updated` (CONTRACT C2)
+
+This is the single, canonical event a requester (and later the requester's pod
+agent) consumes: `(requester_user_id, bundle_id, outcome, at)`. The consent
+listener emits it to the requester over FCM data and the authenticated consent
+SSE stream for `CONSENT_GRANTED`, `CONSENT_DENIED`, `TIMEOUT`, `REVOKED` and
+`CANCELLED` rows of a person-to-person bundle, including each field of a
+partial answer. Payload (identifiers and words only, never a scope, label or
+value):
+
+```json
+{"type": "information_request_updated", "bundle_id": "uuid", "request_id": "one_person_…",
+ "action": "CONSENT_GRANTED|CONSENT_DENIED|TIMEOUT|REVOKED|CANCELLED",
+ "outcome": "pending|granted|partially_granted|denied|expired|revoked|cancelled",
+ "at": "iso", "message_id": "information-request:<bundle>:<request>:<action>:<issued_at>"}
+```
+
+`outcome` is the bundle's `progress.outcome` after this event (omitted only if
+that read failed; the client rereads the bundle anyway). TIMEOUT rows carry
+`bundle_id` since 2026-09-28. Delivery is exactly once per event per device:
+each consent event is claimed by its `consent_audit` id in
+`consent_event_deliveries` (migration 259) before the push, the owner's
+`NOTIFICATION_SENT` record or the requester's doorbell push is sent, so the
+many workers that receive the same PostgreSQL NOTIFY cannot repeat it. Each SSE
+stream lives in one worker and receives the event once. The visible push stays
+bare (see `consent-protocol/docs/reference/fcm-notifications.md`).
 
 `GET /api/one/agent-chat/information-requests/{bundle_id}/conversation`
 (VAULT_OWNER + chat key) returns `{conversationId}` for the requester's own
@@ -244,8 +363,36 @@ history restores the message as a `selection` chip.
 
 `GET /api/one/information-requests/shared-with-me` (VAULT_OWNER) lists the
 current approvals other people gave this person: display names, item labels,
-bundle and request ids, purpose and expiry. It never returns values; those stay
-in each encrypted export and open on the person's own device.
+bundle and request ids, purpose and expiry, plus `grantRef` (the request id),
+`sensitivity`, `fieldOutline` (field names from the owner's catalog, never
+values), `sharedAt`, `accessEndsAt` and `decryptable`. The consent ledger decides
+what is current, so an item approved before its request was withdrawn is still
+listed, and an active grant that no request row names is swept in from the
+ledger with `bundleId: null, decryptable: false` (no existing path can open it).
+It never returns values; those stay in each encrypted export and open on the
+person's own device.
+
+**"Shared with you" card in chat (CONTRACT-2 C6).** One's
+`list_information_shared_with_me` tool returns the same shares as
+`cards: [card]` (plus `card` when exactly one person), each:
+
+```json
+{
+  "kind": "one.shared_with_me_card.v1",
+  "person": {"personRef": "...", "displayName": "Manish Sainani", "profilePath": "/people/<ref>"},
+  "items": [{"grantRef": "<request id>", "requestId": "<request id>", "bundleId": "<uuid>|null",
+             "label": "Tax record information", "sensitivity": "sensitive|standard",
+             "fieldOutline": ["Filing year", "Refund"], "sharedAt": "iso|null",
+             "accessEndsAt": "iso|null", "purpose": "...", "decryptable": true}],
+  "decryptVia": "information_request_exports"
+}
+```
+
+`decryptVia` names the existing path: `GET /api/one/information-requests/{bundleId}`
+then `/exports`, matched by `requestId`. The model reads the same result, so it
+holds labels and field names only. History restores it as the structured
+experience `one.shared_with_me_card.v1` with content `{cards: [...]}`, each card
+re-validated field by field.
 
 `GET /api/one/people/{person_ref}/request-history` requires the authenticated
 Firebase user. It reads only bundles that user requested from the active person
@@ -269,6 +416,21 @@ Active `grants` in that viewer profile include a viewer/subject-bound `bundleId`
 when the grant belongs to a person request. Clients use it to fetch current
 bundle status and encrypted exports even after the recent `requestHistory`
 projection is truncated; it is a locator, not decryption authority.
+
+`GET /api/one/people/{person_ref}/scope-catalog?query=&page=&limit=&catalog_revision=`
+is the server-side search behind the request card's Change picker (consent
+lifecycle Contract C4). Same authentication, `404` and `private, no-store` rules
+as above. It searches human labels plus a small synonym table
+(`hushh_mcp/consent/scope_matcher.py`), so "restaurant" finds food; an empty
+`query` lists everything grouped by domain. `limit` is 1–100 (default 20) and
+`page` is 1–1000. The response is
+`{person:{personRef,displayName}, query, items:[{scope,scopeRef,label,description,domain,domainLabel,sensitivity,wildcard,pathSegments,why?}], page, limit, hasMore, nextPage, totalCount, catalogRevision, paginationReset, catalogTruncated, domains:[{domain,label,count}]}`.
+Items carry an opaque `scopeRef` (repeated as `scope`, matching the proposal card), never a raw `attr.*` scope or a value.
+`why` explains a search hit in plain words. Labels come from
+`hushh_mcp/consent/scope_labels.py`. Scopes that
+`hushh_mcp/consent/requestable_scope_policy.py` refuses (runtime secrets,
+credentials, keys, tokens, protocol namespaces) never appear, here or in any
+other person-to-person catalog, and are refused again at request creation.
 
 ### One Runtime Configuration
 
@@ -659,7 +821,7 @@ auth-required response.
 | GET    | `/api/ria/picks`                                           | Read the signed-in advisor's encrypted-PKM-backed Picks bootstrap; legacy uploads are intentionally unavailable                                                                                        |
 | POST   | `/api/ria/picks`                                           | Sync the owner PKM-derived `ria.advisor_package`, including its bounded investor debate thesis, to currently authorized explicit Picks share artifacts; the thesis is available only to a selected investor source during a live debate run |
 | GET    | `/api/kai/market/insights/{user_id}`                       | Investor market home payload with rights-gated `pick_sources[]` and RIA feed share metadata                                                                                                            |
-| GET    | `/api/one/connections/directory`                           | Paginated Connect directory over named, active profiles whose Firebase accounts still exist and are enabled, including people without a verified phone and verified RIAs in the `all` audience. Account eligibility is resolved before logical pagination; nameless placeholders and deleted or disabled accounts do not consume result slots. Short cached account checks may take up to 60 seconds to reflect an external auth change; an unavailable auth provider returns a retryable error. Explicit discoverability opt-outs are respected for strangers; email and phone labels stay masked. Distinct accounts with the same name remain separate. The `ria` audience narrows to verified advisers. |
+| GET    | `/api/one/connections/directory`                           | Paginated Connect directory over named, active profiles whose Firebase accounts still exist and are enabled, including people without a verified phone and verified RIAs in the `all` audience. Strangers are listed only when they finished signing up in this environment (a `vault_keys` row with `vault_status = 'active'`); people with no vault row or only a `placeholder` one appear only to a viewer who already has a relationship with them (an active connection, a pending connection request, or an active trusted-connection edge, in either direction). The directory-bounded `context` and `scope-catalog` lookups below apply the same rule. Account, vault and relationship eligibility are resolved before logical pagination; nameless placeholders, strangers without an active vault, and deleted or disabled accounts do not consume result slots. Short cached account checks may take up to 60 seconds to reflect an external auth change; an unavailable auth provider returns a retryable error. Explicit discoverability opt-outs are respected for strangers; email and phone labels stay masked. Distinct accounts with the same name remain separate. The `ria` audience narrows to verified advisers. |
 | GET    | `/api/one/connections/{counterpart_user_id}/context`       | Firebase-authenticated, directory-bounded person lookup with current connection state and the latest participant-pair request. An accepted historical request does not establish current Location eligibility. This read grants no action or information-sharing authority. |
 | GET    | `/api/one/connections/{counterpart_user_id}/scope-catalog` | Server-authorized metadata and opaque handles available for a bilateral proposal                                                                                                                       |
 | POST   | `/api/one/connections/requests`                            | Create a connection request with `requested_scope_handles[]` and `offered_scope_handles[]`                                                                                                             |
@@ -890,7 +1052,9 @@ the documented integration path for new clients.
 
 | Method | Path                       | Description                                                                                                         |
 | ------ | -------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| POST   | `/api/kai/support/message` | Send a profile-originated bug report, support request, or developer reachout through the Gmail-backed support inbox |
+| POST   | `/api/kai/support/message` | Firebase-authenticated support send from `one@hushh.ai` to the One inbox, with an internal support-lead BCC. Returns `accepted_by_provider` only after Gmail returns a receipt; known failure and uncertain delivery are distinct. The verified Firebase email, never client text, supplies Reply-To. No report body is persisted by this route. |
+
+`POST /api/account/welcome` is Firebase-authenticated and sends only a first-account welcome to the verified Firebase email. Existing-vault wrapper upsert and primary-method changes require both Firebase auth and a matching `X-Hushh-Consent` VAULT_OWNER bearer, like wrapper deletion. Committed passkey add/remove and existing-passphrase updates trigger a best-effort account notice from One; mail failure cannot roll back the vault change.
 
 #### Kai Analysis
 
@@ -1576,8 +1740,9 @@ only opaque job/share IDs, never a list of Drive IDs or recipient emails.
 | --- | --- |
 | `POST /` | `{searchJobId,clientRequestId,audience:"trusted_circle"}`. Idempotently freezes the completed result IDs and currently eligible, verified recipient identities under an exact review digest. No Google permission or recipient message is created. |
 | `GET /` and `GET /{id}` | Owner's recent review and durable share status: file/recipient counts, exclusions, review revision/digest, and separate queued, confirmed, already-present, skipped, failed, and uncertain effect counts. An uncertain provider write requires review; a queued approval is never called delivered. |
-| `GET /{id}/files?cursor=…` | Owner-only, 25-file pages from the frozen encrypted manifest for inspection before approval. No content downloads. |
+| `GET /{id}/files?cursor=…` | Owner-only, 25-file pages from the frozen encrypted manifest before and after approval. Each file includes bounded per-recipient `outcomes` with recorded status and allowlisted `reasonCode`; original links remain available. No content downloads. |
 | `POST /{id}/approve` | `{revision,reviewDigest,confirmed:true}` from the current exact-set review. HTTP 202 queues file-by-recipient Viewer grants; it does not mean Google access or notification has succeeded. |
+| `POST /{id}/retry` | `{revision,reviewDigest,confirmed:true}` explicitly requeues only a pre-POST `skipped/provider_unavailable` effect with no receipt or lease, in the same frozen manifest. Requires a current owner, exact revision/digest, live connection generation, current recipient relationship and unexpired originating request. Confirmed, stopped, and uncertain effects are never replayed. Returns HTTP 202. |
 | `POST /{id}/stop` | Empty body; fences remaining grants. Already confirmed Google permissions remain and are reported honestly. |
 | `GET /received` and `GET /received/{id}/files?cursor=…` | Current recipient's collection and 25-file pages of *confirmed* original-file links only. The recipient needs a current verified email, not a Drive connector. A changed identity cannot read the old collection. |
 
@@ -1596,6 +1761,17 @@ Only one bulk share can be prepared for a saved search, including across chats o
 repeated requests with different client IDs; reopening recovers the same review
 or progress rather than queueing duplicate grants.
 
+Owner status includes `issues: [{reasonCode,count}]`, `retryableCount` and `canRetry`.
+The displayed partition is `shared + alreadyShared + skipped + failed + needsReview
++ unknown + pending = total`; `processed` counts terminal effects, including failures,
+and is never used as a delivered count. After explicit approval, request delivery
+includes `bulkStatus`, the same recipient-scoped `counts`, and aggregate safe `issues`.
+B receives no failed candidate names or private search metadata. A stopped job keeps
+its stopped status while in-flight effects settle; the originating request then moves
+out of approved and publishes its final outcome. Stop, settlement and retry lock the
+bulk parent before its effects. A retry emits a new request revision without changing
+the reviewed file/recipient manifest.
+
 #### Complete search for a document request
 
 An incoming document request can use the same checkpointed Drive REST search and
@@ -1611,7 +1787,7 @@ file reviews retain their original selection.
 | Method / suffix under `/sharing/requests/{id}` | Contract |
 | --- | --- |
 | `POST /search` | Start or resume the request-bound metadata search. The request ID is the idempotency key; no content or permission is read or written. |
-| `GET /search` | Owner-only checkpoint status, including matched count, pages scanned, incomplete flag, and terminal error. A running or incomplete search cannot be approved as the full set. |
+| `GET /search` | Owner-only checkpoint status, including matched count, unavailable shortcut count, pages scanned, incomplete flag, terminal error and optional `coverage` describing corpus, file kind, frozen date range/basis, scan/exclusion counts and provider page exhaustion. A running or incomplete search cannot be approved as the full set. |
 | `GET /search/files?cursor=…` | Owner-only pages of matching file metadata with stable positions for review. The list may grow until the search completes. |
 | `POST /bulk` | Freeze the completed search for this request's verified recipient, omitting owner-deselected and unavailable shortcut positions. Returns the exact review digest and selected count; no permission is created. |
 
@@ -1625,6 +1801,21 @@ search and sharing. Search results are Drive metadata matches for owner review,
 not proof that every document's contents cover a requested period. The existing
 owner search operational cache uses server-held encryption and is not strict
 client-key zero knowledge, as described above.
+
+Request searches preserve shortcut target metadata through the actual REST projection,
+resolve targets and folder shortcuts, and traverse matching meeting-folder descendants
+with durable encrypted cursors. Document-like note formats include Google Docs, PDF,
+plain text and Word documents; recordings are excluded from a notes request. Topic
+matching uses Drive's file search and existing meeting-note eligibility. The period
+uses a date in the file title first, then creation/modification metadata; it is not a
+content-date verification. Provider pagination is exhausted across the user corpus
+and each member shared drive, including empty pages with continuation tokens; folder
+or result bounds and `incompleteSearch` prevent an exhausted-coverage claim. Every
+selected result is an original file deduplicated by ID. Link-shared originals use
+Google's resource-key header for metadata and permission operations; keys remain
+inside encrypted operational metadata. Only documented rate-limit reason codes on
+a bounded 403 response are treated as transient. An uncertain permission POST is
+reconciled with reads rather than automatically repeated.
 
 ### Exact-file Drive sharing (default-off)
 

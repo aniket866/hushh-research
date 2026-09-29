@@ -27,6 +27,7 @@ from hushh_mcp.services.external_mcp_client import ExternalMcpToolResult
 from hushh_mcp.services.google_drive_adapter import (
     FILE_ID,
     LIVE_POLICY_HASH,
+    RESOURCE_KEY,
     DriveReadError,
     GoogleDriveAdapter,
 )
@@ -185,6 +186,7 @@ def _as_mcp_file(item: dict[str, Any]) -> dict[str, Any]:
         "mimeType": item.get("mimeType"),
         "modifiedTime": item.get("modifiedTime"),
         "createdTime": item.get("createdTime"),
+        **{key: item[key] for key in ("driveId", "resourceKey") if item.get(key) is not None},
         "viewUrl": item.get("webViewLink"),
         "shortcutDetails": item.get("shortcutDetails"),
     }
@@ -349,12 +351,19 @@ class GoogleDriveRestTransport:
     async def _get_file_metadata(self, arguments: dict[str, Any], token: str) -> dict:
         target = arguments.get("fileId")
         if (
-            set(arguments) != {"fileId"}
+            not {"fileId"} <= set(arguments) <= {"fileId", "resourceKey"}
             or not isinstance(target, str)
             or not FILE_ID.fullmatch(target)
         ):
             raise DriveOAuthError("invalid_argument", status_code=400)
-        return {"file": await self.adapter.get_file_facts(file_id=target, access_token=token)}
+        key = _resource_key_argument(arguments)
+        return {
+            "file": await self.adapter.get_file_facts(
+                file_id=target,
+                access_token=token,
+                **({"resource_key": key} if key is not None else {}),
+            )
+        }
 
     async def _list_recent_files(self, arguments: dict[str, Any], token: str) -> dict:
         page_size, page_token = _page_arguments(arguments)
@@ -395,6 +404,10 @@ class GoogleDriveRestTransport:
             not isinstance(drive_id, str) or not FILE_ID.fullmatch(drive_id)
         ):
             raise DriveOAuthError("invalid_argument", status_code=400)
+        key = _resource_key_argument(arguments)
+        folder = arguments.get("folderId")
+        if key is not None and folder is None:
+            raise DriveOAuthError("invalid_argument", status_code=400)
         page = await self.adapter.list_files(
             access_token=token,
             query=q,
@@ -402,6 +415,7 @@ class GoogleDriveRestTransport:
             page_token=page_token,
             order_by=None if full_text else order,
             **({"drive_id": drive_id} if drive_id is not None else {}),
+            **({"resource_keys": {folder: key}} if key is not None else {}),
         )
         return _project_page(page, _page_files(page))
 
@@ -580,6 +594,15 @@ def _page_arguments(arguments: dict[str, Any]) -> tuple[int, str | None]:
     return page_size, page_token
 
 
+def _resource_key_argument(arguments: dict[str, Any]) -> str | None:
+    value = arguments.get("resourceKey")
+    if "resourceKey" in arguments and (
+        not isinstance(value, str) or not RESOURCE_KEY.fullmatch(value)
+    ):
+        raise DriveOAuthError("invalid_argument", status_code=400)
+    return value
+
+
 def _page_files(page: dict[str, Any]) -> list[Any]:
     files = page.get("files", [])
     if (
@@ -599,4 +622,26 @@ def _project_page(page: dict[str, Any], files: list[Any]) -> dict:
             "incompleteSearch": page.get("incompleteSearch", False),
         }
     )
+    # The shared MCP metadata filter intentionally keeps only its historical
+    # scalar fields. This REST-only sharing search also needs the owner-specific
+    # canShare fact; validate and reattach exactly that fact after filtering.
+    for item, destination in zip(files, projected["files"], strict=True):
+        capabilities = item.get("capabilities")
+        if capabilities is not None:
+            if not isinstance(capabilities, dict) or (
+                capabilities.get("canShare") is not None
+                and type(capabilities["canShare"]) is not bool
+            ):
+                raise DriveReadError("provider_response_invalid")
+            if "canShare" in capabilities:
+                destination["capabilities"] = {"canShare": capabilities["canShare"]}
+        encryption = item.get("clientEncryptionDetails")
+        if encryption is not None:
+            if not isinstance(encryption, dict) or not isinstance(
+                encryption.get("encryptionState"), str
+            ):
+                raise DriveReadError("provider_response_invalid")
+            destination["clientEncryptionDetails"] = {
+                "encryptionState": encryption["encryptionState"]
+            }
     return projected
